@@ -45,7 +45,7 @@ from odemis.gui.comp.canvas import CAN_DRAG, CAN_FOCUS
 from odemis.gui.model import TOOL_NONE
 from odemis.gui.util import img, get_picture_folder, call_in_wx_main, \
     wxlimit_invocation
-from odemis.gui.util.widgets import ProgressiveFutureConnector
+from odemis.gui.util.widgets import ProgressiveFutureConnector, EllipsisAnimator
 from odemis.gui.win.acquisition import AcquisitionDialog, \
     ShowAcquisitionFileDialog
 from odemis.util import units
@@ -55,6 +55,7 @@ import subprocess
 import threading
 import time
 import wx
+from odemis import util
 
 import odemis.gui.model as guimod
 
@@ -335,6 +336,7 @@ class SecomAcquiController(object):
         tab_panel: (wx.Frame): the frame which contains the 4 viewports
         """
         self._tab_data_model = tab_data
+        self._main_data_model = tab_data.main
         self._tab_panel = tab_panel
 
         # Listen to "acquire image" button
@@ -345,6 +347,8 @@ class SecomAcquiController(object):
         tab_data.streams.subscribe(self.on_stream_chamber)
         tab_data.main.chamberState.subscribe(self.on_stream_chamber, init=True)
 
+        self._main_data_model.is_preparing.subscribe(self.on_preparation)
+
     def on_stream_chamber(self, unused):
         """
         Called when chamber state or streams change.
@@ -353,7 +357,11 @@ class SecomAcquiController(object):
         st_present = not not self._tab_data_model.streams.value
         ch_vacuum = (self._tab_data_model.main.chamberState.value
                         in {guimod.CHAMBER_VACUUM, guimod.CHAMBER_UNKNOWN})
-        self._tab_panel.btn_secom_acquire.Enable(st_present and ch_vacuum)
+        self._tab_panel.btn_secom_acquire.Enable(st_present and ch_vacuum and not self._main_data_model.is_preparing.value)
+
+    @call_in_wx_main
+    def on_preparation(self, is_preparing):
+        self._tab_panel.btn_secom_acquire.Enable(not is_preparing)
 
     def on_acquire(self, evt):
         self.open_acquisition_dialog()
@@ -444,6 +452,8 @@ class SparcAcquiController(object):
         self.acq_future = None
         self.gauge_acq = self._tab_panel.gauge_sparc_acq
         self.lbl_acqestimate = self._tab_panel.lbl_sparc_acq_estimate
+        self.bmp_acq_status_warn = self._tab_panel.bmp_acq_status_warn
+        self.bmp_acq_status_info = self._tab_panel.bmp_acq_status_info
         self._acq_future_connector = None
 
         self._stream_paused = ()
@@ -471,6 +481,9 @@ class SparcAcquiController(object):
 
         self._roa = tab_data.semStream.roi
         self._roa.subscribe(self._onROA, init=True)
+
+        self._ellipsis_animator = None  # animator for messages containing ellipsis character
+        self._main_data_model.is_preparing.subscribe(self.on_preparation)
 
     def __del__(self):
         self._executor.shutdown(wait=False)
@@ -515,6 +528,11 @@ class SparcAcquiController(object):
         self.btn_acquire.Enable(roi != UNDEFINED_ROI)
         self.update_acquisition_time()  # to update the message
 
+    @call_in_wx_main
+    def on_preparation(self, is_preparing):
+        self.btn_acquire.Enable(not is_preparing)
+        self.update_acquisition_time()
+
     def _onStreams(self, streams):
         """
         Called when streams are added/deleted. Used to listen to settings change
@@ -552,18 +570,35 @@ class SparcAcquiController(object):
 
     @wxlimit_invocation(1) # max 1/s
     def update_acquisition_time(self):
+        if self._ellipsis_animator:
+            # cancel if there is an ellipsis animator updating the status message
+            self._ellipsis_animator.stop()
+            self._ellipsis_animator = None
 
-        if self._roa.value == UNDEFINED_ROI:
+        lvl = None  # icon status shown
+        if self._main_data_model.is_preparing.value:
+            txt = u"Optical path is being reconfigured…"
+            self._ellipsis_animator = EllipsisAnimator(txt, self.lbl_acqestimate)
+            self._ellipsis_animator.start()
+            lvl = logging.INFO
+        elif self._roa.value == UNDEFINED_ROI:
             # TODO: update the default text to be the same
-            txt = "Region of acquisition needs to be selected"
+            txt = u"Region of acquisition needs to be selected"
+            lvl = logging.WARN
         else:
             streams = self._tab_data_model.acquisitionView.getStreams()
             acq_time = acq.estimateTime(streams)
             acq_time = math.ceil(acq_time) # round a bit pessimistic
-            txt = "Estimated time is {}."
+            txt = u"Estimated time is {}."
             txt = txt.format(units.readable_time(acq_time))
 
+        self._show_status_icons(lvl)
         self.lbl_acqestimate.SetLabel(txt)
+
+    def _show_status_icons(self, lvl):
+        self.bmp_acq_status_info.Show(lvl in (logging.INFO, logging.DEBUG))
+        self.bmp_acq_status_warn.Show(lvl == logging.WARN)
+        self._tab_panel.Layout()
 
     def _pause_streams(self):
         """
